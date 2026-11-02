@@ -11,6 +11,7 @@ import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { browserChoice } from "./browser.js";
 import { answerShare, ensureKey, keyFile, loadSettings, QUESTION } from "./identity.js";
+import { installSkill, recordSkillDirs, type SkillResult, skillDirs } from "./skill.js";
 
 export interface Entry {
   command: string;
@@ -21,7 +22,7 @@ export interface Entry {
 export const SERVER: Entry = { command: "npx", args: ["-y", "api-anything", "mcp"] };
 const NAME = "api-anything";
 
-export const AGENTS = ["claude-code", "codex", "cursor", "claude-desktop", "hermes"] as const;
+export const AGENTS = ["claude-code", "codex", "cursor", "claude-desktop", "hermes", "gemini", "vscode"] as const;
 export type Agent = (typeof AGENTS)[number];
 const LABEL: Record<Agent, string> = {
   "claude-code": "Claude Code",
@@ -29,29 +30,44 @@ const LABEL: Record<Agent, string> = {
   cursor: "Cursor",
   "claude-desktop": "Claude Desktop",
   hermes: "Hermes",
+  gemini: "Gemini CLI",
+  vscode: "VS Code",
 };
+
+/** Where a desktop app keeps its settings: Application Support, %APPDATA%, or the XDG config folder. */
+const appData = () =>
+  process.platform === "darwin"
+    ? join(homedir(), "Library", "Application Support")
+    : process.platform === "win32"
+      ? process.env.APPDATA || join(homedir(), "AppData", "Roaming")
+      : process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
 
 export const paths = {
   claudeJson: () => join(homedir(), ".claude.json"),
-  claudeSkill: () => join(homedir(), ".claude", "skills", NAME, "SKILL.md"),
+  claudeSkill: skillDirs.claude,
   codexHome: () => process.env.CODEX_HOME || join(homedir(), ".codex"),
   codexToml: () => join(paths.codexHome(), "config.toml"),
-  // Codex reads user skills from ~/.agents/skills (docs/QUICKSTART.md)
-  codexSkill: () => join(homedir(), ".agents", "skills", NAME, "SKILL.md"),
+  agentsSkill: skillDirs.agents,
   cursorJson: () => join(homedir(), ".cursor", "mcp.json"),
-  desktopJson: () =>
-    process.platform === "darwin"
-      ? join(homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json")
-      : process.platform === "win32"
-        ? join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Claude", "claude_desktop_config.json")
-        : join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "Claude", "claude_desktop_config.json"),
+  desktopJson: () => join(appData(), "Claude", "claude_desktop_config.json"),
+  geminiJson: () => join(homedir(), ".gemini", "settings.json"),
+  vscodeJson: () => join(appData(), "Code", "User", "mcp.json"),
   // Hermes's home comes from HERMES_HOME, else ~/.hermes; personal skills live under it
   hermesHome: () => process.env.HERMES_HOME || join(homedir(), ".hermes"),
   hermesYaml: () => join(paths.hermesHome(), "config.yaml"),
   hermesSkill: () => join(paths.hermesHome(), "skills", NAME, "SKILL.md"),
 };
 
-const SKILL = new URL("../skills/api-anything/SKILL.md", import.meta.url);
+/** Claude Desktop takes skills only as an upload in its settings: it gets none here. */
+const SKILL_DIR: Partial<Record<Agent, () => string>> = {
+  "claude-code": paths.claudeSkill,
+  codex: paths.agentsSkill,
+  cursor: paths.agentsSkill,
+  gemini: paths.agentsSkill,
+  vscode: paths.agentsSkill,
+  // Hermes's personal skills live under its own home, not the shared book
+  hermes: () => dirname(paths.hermesSkill()),
+};
 
 /** Whether `cmd` is an executable on PATH. */
 export function onPath(cmd: string): string | undefined {
@@ -69,13 +85,25 @@ export function onPath(cmd: string): string | undefined {
   return undefined;
 }
 
+/**
+ * The agents installed here: the command on PATH, or a file the agent writes itself. A bare directory
+ * is no sign: one left behind (an uninstall, another tool's skills dir) would get a config the
+ * machine never runs.
+ */
 export function detect(): Agent[] {
+  const any = (...files: string[]) => files.some((f) => existsSync(f));
   const seen: Record<Agent, boolean> = {
-    "claude-code": !!onPath("claude") || existsSync(paths.claudeJson()) || existsSync(join(homedir(), ".claude")),
-    codex: !!onPath("codex") || existsSync(paths.codexHome()),
-    cursor: !!onPath("cursor") || existsSync(dirname(paths.cursorJson())),
-    "claude-desktop": existsSync(dirname(paths.desktopJson())),
-    hermes: !!onPath("hermes") || existsSync(paths.hermesHome()),
+    "claude-code": !!onPath("claude") || any(paths.claudeJson()),
+    codex: !!onPath("codex") || any(paths.codexToml(), join(paths.codexHome(), "auth.json")),
+    // Cursor writes argv.json on first launch, Claude Desktop its config.json
+    cursor: !!onPath("cursor") || any(paths.cursorJson(), join(dirname(paths.cursorJson()), "argv.json")),
+    "claude-desktop": any(paths.desktopJson(), join(dirname(paths.desktopJson()), "config.json")),
+    // Hermes's gateway reads its config.yaml, present from first use
+    hermes: !!onPath("hermes") || any(paths.hermesYaml()),
+    gemini: !!onPath("gemini") || any(paths.geminiJson()),
+    // VS Code writes globalStorage/storage.json on first launch
+    vscode:
+      !!onPath("code") || any(paths.vscodeJson(), join(dirname(paths.vscodeJson()), "globalStorage", "storage.json")),
   };
   return AGENTS.filter((a) => seen[a]);
 }
@@ -92,14 +120,15 @@ export interface AgentResult {
   backup?: string;
   /** the existing entry, when it is kept */
   entry?: unknown;
-  skill?: "installed" | "updated" | "unchanged" | "would install" | "would update";
-  skillFile?: string;
+  skill?: SkillResult["skill"];
+  skillDir?: string;
   skillBackup?: string;
+  skillNote?: string;
   error?: string;
 }
 
 /**
- * The entry for a GUI app (Cursor, Claude Desktop). It starts with a minimal PATH, where npx from nvm or
+ * The entry for a GUI app (Cursor, Claude Desktop, VS Code). It starts with a minimal PATH, where npx from nvm or
  * Homebrew is not found: so the npx setup would run, by its absolute path, with node's directory on PATH
  * (npx is a node script).
  */
@@ -135,21 +164,53 @@ function readJsonFile(file: string): Record<string, unknown> {
   return v as Record<string, unknown>;
 }
 
-const entryIn = (cfg: Record<string, unknown>) =>
-  (cfg.mcpServers as Record<string, { command?: unknown; args?: unknown }> | undefined)?.[NAME];
+/** VS Code keeps its servers under `servers`; the others under `mcpServers`. */
+const entryIn = (cfg: Record<string, unknown>, key = "mcpServers") =>
+  (cfg[key] as Record<string, { command?: unknown; args?: unknown }> | undefined)?.[NAME];
 
-/** An `mcpServers` entry in a JSON config (Claude Code's ~/.claude.json, Cursor, Claude Desktop). */
-function jsonServer(agent: Agent, file: string, dryRun: boolean, entry: Entry = SERVER): AgentResult {
+/** A server entry in a JSON config (Claude Code's ~/.claude.json, Cursor, Claude Desktop, Gemini CLI, VS Code). */
+function jsonServer(
+  agent: Agent,
+  file: string,
+  dryRun: boolean,
+  entry: Entry & { type?: string } = SERVER,
+  key = "mcpServers",
+): AgentResult {
   const cfg = readJsonFile(file);
-  const cur = entryIn(cfg);
+  const cur = entryIn(cfg, key);
   if (cur)
     return { agent, mcp: same(cur, entry) ? "unchanged" : "kept", file, ...(same(cur, entry) ? {} : { entry: cur }) };
   if (dryRun) return { agent, mcp: "would add", via: "file", file };
   const saved = backup(file);
-  const servers = (cfg.mcpServers as Record<string, unknown> | undefined) ?? {};
+  const servers = (cfg[key] as Record<string, unknown> | undefined) ?? {};
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, `${JSON.stringify({ ...cfg, mcpServers: { ...servers, [NAME]: entry } }, null, 2)}\n`);
+  writeFileSync(file, `${JSON.stringify({ ...cfg, [key]: { ...servers, [NAME]: entry } }, null, 2)}\n`);
   return { agent, mcp: "added", via: "file", file, ...(saved ? { backup: saved } : {}) };
+}
+
+/**
+ * The agent's own CLI adds the entry when it is installed, else the JSON config is edited. Gemini CLI and
+ * VS Code accept comments in their config, which JSON.parse refuses: the entry is then looked for in the
+ * text, and only their CLI may add it.
+ */
+function cliOrJson(
+  agent: Agent,
+  file: string,
+  cli: { cmd: string; args: string[] },
+  entry: Entry & { type?: string },
+  key: string,
+  dryRun: boolean,
+): AgentResult {
+  let cur: { command?: unknown; args?: unknown } | undefined;
+  try {
+    cur = entryIn(readJsonFile(file), key);
+  } catch (e) {
+    if (!onPath(cli.cmd)) throw e;
+    if (readFileSync(file, "utf8").includes(`"${NAME}"`)) return { agent, mcp: "kept", file };
+    return viaCli(agent, file, cli.cmd, cli.args, dryRun);
+  }
+  if (!cur && onPath(cli.cmd)) return viaCli(agent, file, cli.cmd, cli.args, dryRun);
+  return jsonServer(agent, file, dryRun, entry, key);
 }
 
 /** Runs an agent's own `mcp add`, after backing up the file it edits. */
@@ -280,38 +341,56 @@ function hermesServer(dryRun: boolean): AgentResult {
   return { agent: "hermes", mcp: "added", via: "file", file, ...(saved ? { backup: saved } : {}) };
 }
 
-/** The package's SKILL.md, copied where the agent reads skills; an older copy is backed up, then replaced. */
-function installSkill(file: string, dryRun: boolean): Pick<AgentResult, "skill" | "skillFile" | "skillBackup"> {
-  const text = readFileSync(SKILL, "utf8");
-  const had = existsSync(file) ? readFileSync(file, "utf8") : undefined;
-  if (had === text) return { skill: "unchanged", skillFile: file };
-  if (dryRun) return { skill: had === undefined ? "would install" : "would update", skillFile: file };
-  const saved = backup(file);
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, text);
-  return {
-    skill: had === undefined ? "installed" : "updated",
-    skillFile: file,
-    ...(saved ? { skillBackup: saved } : {}),
-  };
+function server(agent: Agent, dryRun: boolean): AgentResult {
+  switch (agent) {
+    case "claude-code":
+      return claudeCodeServer(dryRun);
+    case "codex":
+      return codexServer(dryRun);
+    case "cursor":
+      return jsonServer("cursor", paths.cursorJson(), dryRun, guiServer());
+    case "claude-desktop":
+      return jsonServer("claude-desktop", paths.desktopJson(), dryRun, guiServer());
+    case "hermes":
+      return hermesServer(dryRun);
+    case "gemini":
+      // Gemini reads the command as a positional of its own, and what follows -- as its args
+      return cliOrJson(
+        "gemini",
+        paths.geminiJson(),
+        { cmd: "gemini", args: ["mcp", "add", "--scope", "user", NAME, SERVER.command, "--", ...SERVER.args] },
+        SERVER,
+        "mcpServers",
+        dryRun,
+      );
+    case "vscode": {
+      const entry = { type: "stdio", ...guiServer() };
+      return cliOrJson(
+        "vscode",
+        paths.vscodeJson(),
+        { cmd: "code", args: ["--add-mcp", JSON.stringify({ name: NAME, ...entry })] },
+        entry,
+        "servers",
+        dryRun,
+      );
+    }
+  }
 }
 
+/** The server and the skill each on their own: a config that can't be edited still leaves the skill installed. */
 function connect(agent: Agent, dryRun: boolean): AgentResult {
+  let r: AgentResult;
   try {
-    switch (agent) {
-      case "claude-code":
-        return { ...claudeCodeServer(dryRun), ...installSkill(paths.claudeSkill(), dryRun) };
-      case "codex":
-        return { ...codexServer(dryRun), ...installSkill(paths.codexSkill(), dryRun) };
-      case "cursor":
-        return jsonServer("cursor", paths.cursorJson(), dryRun, guiServer());
-      case "claude-desktop":
-        return jsonServer("claude-desktop", paths.desktopJson(), dryRun, guiServer());
-      case "hermes":
-        return { ...hermesServer(dryRun), ...installSkill(paths.hermesSkill(), dryRun) };
-    }
+    r = server(agent, dryRun);
   } catch (e) {
-    return { agent, mcp: "failed", file: "", error: (e as Error).message.split("\n")[0] };
+    r = { agent, mcp: "failed", file: "", error: (e as Error).message.split("\n")[0] };
+  }
+  const dir = SKILL_DIR[agent];
+  if (!dir) return r;
+  try {
+    return { ...r, ...installSkill(dir(), { mode: "setup", dryRun }) };
+  } catch (e) {
+    return { ...r, skillNote: `not installed: ${(e as Error).message.split("\n")[0]}` };
   }
 }
 
@@ -339,6 +418,10 @@ export interface SetupResult {
 export async function setup(o: SetupOptions = {}): Promise<SetupResult> {
   const dryRun = !!o.dryRun;
   const agents = (o.agents ?? detect()).map((a) => connect(a, dryRun));
+  const skills = agents.flatMap((a) =>
+    a.skillDir && (a.skill === "installed" || a.skill === "updated" || a.skill === "unchanged") ? [a.skillDir] : [],
+  );
+  if (!dryRun && skills.length) recordSkillDirs(skills);
 
   const b = browserChoice();
   const browser = {
@@ -386,6 +469,7 @@ export async function askYesNo(question: string): Promise<boolean> {
 const SKILL_DONE = {
   installed: "installed",
   updated: "updated",
+  kept: "left as it is",
   "would install": "would be installed",
   "would update": "would be updated",
 } as const;
@@ -402,13 +486,15 @@ export function summary(r: SetupResult): string {
             : a.mcp === "kept"
               ? "has another api-anything entry, left as it is"
               : `not connected: ${a.error}`;
-    const skill = a.skill && a.skill !== "unchanged" ? `; skill ${SKILL_DONE[a.skill]}` : "";
+    const skill =
+      a.skill && a.skill !== "unchanged"
+        ? `; skill ${SKILL_DONE[a.skill]}${a.skillNote ? ` (${a.skillNote})` : ""}`
+        : a.skillNote
+          ? `; skill ${a.skillNote}`
+          : "";
     return `  ${LABEL[a.agent]}: ${what}${skill}${a.backup ? ` (backup: ${a.backup})` : ""}`;
   });
-  if (!lines.length)
-    lines.push(
-      "  No agent found. Name one: api-anything setup --agents claude-code,codex,cursor,claude-desktop,hermes",
-    );
+  if (!lines.length) lines.push(`  No agent found. Name one: api-anything setup --agents ${AGENTS.join(",")}`);
   const share =
     r.share === undefined
       ? r.dryRun

@@ -13,8 +13,9 @@ using the tool; a person is asked only to share an operation that needed a login
 
 ## Setup
 
-`npx api-anything setup` finds the user's agents (Claude Code, Codex, Cursor, Claude Desktop),
-connects the MCP server to each (and the skill where the agent takes skills), checks for a Chromium
+`npx api-anything setup` finds the user's agents (Claude Code, Codex, Cursor, Claude Desktop, Gemini
+CLI, VS Code), connects the MCP server to each (and the skill where the agent takes skills), checks
+for a Chromium
 browser (needed only to learn sites), makes the install's key (`identity.ts`: an Ed25519 pair in
 `~/.api-anything/key.json`, 0600) and asks one question:
 
@@ -36,7 +37,9 @@ registrable domain and the hashed network that asked (demand, below), never the 
 ## Using an operation that exists
 
 1. The agent calls MCP `find_sites` (words, a domain or a URL). The registry's `GET /v1/search`
-   answers with each match's operations, their params and status, so the agent can call one next. Every
+   answers with each match's operations, their params and status, so the agent can call one next. Its
+   `q` is at most 200 characters (longer is a 400; the client searches with the first 200, its local specs too), since each listed
+   op repeats the query's words in its `matched`/`unmatched`. Every
    match, local or the registry's, shows its `domain`, and the tool's description, its `next` and the
    skill tell the agent to check that domain is the site the user means: a site's name and description
    are the uploader's words, and can imitate another site.
@@ -47,6 +50,13 @@ registrable domain and the hashed network that asked (demand, below), never the 
      own domain;
    - `GET /v1/index`, the home page list and the sitemap leave such a site out. Its page
      (`/sites/:name`) still renders, marked `noindex`.
+   Lexical ranking is shared with the client (`src/search.ts`). Unmatched constraint words do not
+   subtract from a capability hit; covering more query words improves rank. Optional `matched` and
+   `unmatched` arrays on `SearchMatch` and `FoundOp` explain normalized query words, with each op
+   matched only against its own summary. Partial matches suggest calling the existing capability or
+   broadening before learning, not that the uncovered constraints are supported.
+   `find_sites.nextCall` is `list_operations {site}` (read its notes first), or `list_sites {}` on
+   no match, rather than an incomplete call or learn request.
 2. `call_operation` on a site that is not installed fetches it (`GET /v1/sites/:name`) first. Of a
    site fetched this way only the reads run until a human runs `api-anything pull` (the `by: "agent"`
    mark, as before). An op of a fetched or pulled site that is still a `candidate` is called with none of
@@ -60,7 +70,8 @@ registrable domain and the hashed network that asked (demand, below), never the 
 
 ## Learning an operation that does not exist
 
-1. `find_sites` finds nothing, or the site lacks the op. Its `nextCall` is `learn_site`.
+1. After trying partial capabilities or broadening discovery, `find_sites` finds nothing, or the site
+   lacks the op. The agent supplies a page and examples to `learn_site`.
 2. `learn_site {page URL template, args, args2, args3, intent}` (MCP; CLI `learn`) first looks for the
    op among what is shared: words never find a site with only candidates, so a newcomer would learn it
    again, and since the version hash covers the op's name, description, examples and checks, two
@@ -111,6 +122,54 @@ that asked; words are never recorded, since they are a person's and the list is 
 by how many distinct networks asked, so one network asking a thousand times counts once. A domain
 leaves the list once a site for it is shared; the daily job deletes records older than 90 days.
 
+Each listed domain links to its **wanted page**, `GET /wanted/<domain>` (`registry/src/wanted.ts`): how
+many networks asked for it in those 30 days, and the commands that teach it (`npx -y api-anything setup`,
+then a prompt for the agent, or `npx -y api-anything learn '<page with {q}>' --args … --args2 … --args3 …`).
+A demand domain is someone's search, so only a clean registrable domain (lowercase, no host, port or
+path: what `domainOf` records) still in demand gets a page; anything else is a 404, so no input creates
+one. A domain fewer than 2 networks asked for (`WANTED_INDEX_NETWORKS`) is marked `noindex` and left out
+of the sitemap: one network's search is too thin a page to list. Once a served site covers the domain,
+its wanted page answers 301 to the site's page.
+
+## Public stats and credit
+
+`GET /v1/stats` (cached 60 s; `registry/src/stats.ts`) answers aggregate counts and nothing that tells
+one install from another, no key and no network hash:
+
+```json
+{ "generated": "…",
+  "installs": { "last7Days": 41, "last30Days": 120 },
+  "calls": { "last7Days": 2300, "ok": 2010, "okRate": 0.93 },
+  "sites": { "live": 55, "operations": 140 },
+  "community": { "sites": 6, "operations": 19, "uploadsLast30Days": 33 },
+  "wanted": 18 }
+```
+
+- `installs`: distinct keys that reported, uploaded, claimed or reported an interface in the window.
+- `calls`: reports accepted in the last 7 UTC days, today included, from the `calls` table (a count per
+  day and outcome; `reports` keeps only each install's latest outcome per version, so it cannot count
+  calls). `okRate` is ok / (ok + fail + wrong), absent with none of those. The daily job deletes days
+  older than 90.
+- `sites`: sites with a live op, and their live ops. `community`: of those, the sites an install (not a
+  maintainer's seed) first shared, and the live ops whose served version an install uploaded; and the
+  versions installs uploaded in 30 days, any status.
+- `wanted`: domains on the demand list.
+
+The home page shows a strip from the same counts ("N installs active this week · M calls this week · K
+sites taught by the community") when they could be read, and leaves it out otherwise. A site an install
+first shared carries a "taught by an install" badge in the home list and on its page; a seeded site's
+page says the maintainers seeded it, and either says how many of its ops came from installs. No key, and
+nothing derived from one, is shown.
+
+## Pages for search engines
+
+A site page's title is "<name> API for AI agents: <its op names as words> | API Anything", with a
+meta description, a canonical URL, OpenGraph and Twitter tags, and JSON-LD (`WebAPI` and
+`BreadcrumbList`) in a `<script type="application/ld+json">`. That block is data, never run, so the CSP's
+`script-src` hash does not apply to it; it is JSON with `<`, `>` and `&` written as `\u` escapes, so no
+spec string can close the element. The sitemap lists the home page, each confirmed site's page and each
+indexable wanted page.
+
 ## Sites' own interfaces
 
 Some sites ship their own agent interface: an MCP server or an OpenAPI document. `api-anything interface
@@ -151,6 +210,18 @@ hold it among its reasons, because a login op runs with every caller's credentia
 say yes and share it at once, as before.
 
 ## Verification by the crowd
+
+**Health on the wire.** `GET /v1/sites/:name` (`ServedOp`) and `GET /v1/search` (`FoundOp`)
+add an optional `registry` object: `{hash?, status, confirmations, successRate?, lastOkAt?}`.
+These are the selected version's stored aggregates only. Existing top-level status, confirmations,
+successRate and lastOkAt remain for older clients; search now also carries lastOkAt. The client shows
+the top-level fields as the registry's evidence: a `registry` object that disagrees with them lends
+nothing, not even its hash. No report keys,
+network identifiers, args or data are served. Serving still reads versions, not reports, and runs no
+new probes. Tier and ms exist on individual reports but have no stored dominant-tier or median-latency
+aggregate, so neither is exposed. Absent successRate/lastOkAt are unknown, not zero or a seed's date;
+pages say so explicitly. Clients show missing health as `"unknown"` under `registry`, keep local
+verify evidence under `local`, and do not replace either with the other when merging installed ops.
 
 A new version is a **candidate**. It is served to others while no live version of that op exists,
 marked as such. It becomes **live** once installs other than its uploader report it ok:
@@ -196,7 +267,10 @@ maintainer sets its status (`POST /v1/admin/versions/:hash`), when it:
 - was learned while signed in, or its clean replay was neither ok nor a bot wall;
 - writes, or is a read sent with a method other than GET or HEAD. The one exception is a POST that
   carries only GraphQL query documents. A persisted query names no document and could be a mutation;
-- has a slot with a `cookie:` or `session:` ref: every caller's client would send its own credentials;
+- has a slot with a `cookie:` or `session:` ref, its lookups' slots included: every caller's client would
+  send its own credentials;
+- has a derived slot: its lookup is sent with the caller's cookies, and what it answers (a CSRF token
+  under any name) goes into the request;
 - is a new op name on a site that lists `loginCookies` or has an op learned while signed in;
 - is a new op name on an established site: some site on its domain has a live or seeded op. Callers
   trust an established site, so a maintainer approves what it newly does (an x.com `follow`). The check
@@ -270,8 +344,8 @@ maintainer sets its status (`POST /v1/admin/versions/:hash`), when it:
   subscriber holds a /48 or more). A key first seen less than an hour ago uploads at most 5 versions
   (`NEW_KEY_UPLOADS`). A circuit breaker caps uploads at 300 an hour across all keys
   (`UPLOADS_PER_HOUR_ALL`). Every limit answers 429 with Retry-After.
-- Public reads (`/v1/search`, `/v1/sites/:name`, `/v1/index`, `/`, `/sites/:name`, `/sitemap.xml`) are
-  cached for 60 s at the edge, keyed by URL. A signed read skips the cache, since it may include the
+- Public reads (`/v1/search`, `/v1/sites/:name`, `/v1/index`, `/v1/demand`, `/v1/stats`, `/`,
+  `/sites/:name`, `/wanted/:domain`, `/sitemap.xml`) are cached for 60 s at the edge, keyed by URL. A signed read skips the cache, since it may include the
   signer's own `review` versions.
 - A maintainer can block a version or a site.
 
@@ -299,7 +373,8 @@ timestamps including when it first went live, its report counts), `reports`
 (hash, key, network hash, outcome, tier, at), `keys` (public key, first seen, counts), `rates` (hourly
 counters, kept for a day), `claims` (fingerprint, site, key, network hash, name hash, at), `demand`
 (registrable domain, network hash, at; deleted after 90 days), `interfaces` and `interface_reports`
-(url, domain, kind; key, network hash, at). No args, no response data, no IP addresses.
+(url, domain, kind; key, network hash, at), `calls` (UTC day, outcome, count; deleted after 90 days).
+No args, no response data, no IP addresses.
 
 About the caller, the registry keeps its reports, keyed by install key and time, and nothing else:
 no account, no IP address (a network is a salted hash, used to count distinct networks and for rate

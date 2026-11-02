@@ -4,8 +4,19 @@
  * go, the pages a browser holding the user's sessions opens, and whether an op writes.
  */
 import { parse } from "tldts";
+import { walk } from "./codec.js";
 import { siteOf } from "./domain.js";
-import { literalCredentials, providerKeys, scanSecrets, signInFills } from "./secrets.js";
+import { linkProblems } from "./links.js";
+import {
+  credentialName,
+  lastToken,
+  leafName,
+  literalCredentials,
+  providerKeys,
+  SESSION_FIELD,
+  scanSecrets,
+  signInFills,
+} from "./secrets.js";
 import type { Operation, Readback, ReadbackRead, Request, Site } from "./spec.js";
 
 export const LIMITS = {
@@ -24,6 +35,15 @@ const READ_METHODS = new Set(["GET", "HEAD", "POST"]);
 const READ_ONLY = new Set(["GET", "HEAD", "OPTIONS"]);
 // Op and param names are spelled in the commands `next` hints give an agent to run.
 const NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+/**
+ * What a looked-up value may be: an identifier (a numeric id, a slug, a UUID, a base64 id). The answer is
+ * text the site's users may write, so nothing with spaces, braces, quotes or parentheses, which could make
+ * a GraphQL document or a query of it wherever it lands, however encoded. Learning skips any other value.
+ */
+export const DERIVED_VALUE = /^[\w.~:@+=/-]{1,512}$/;
+
+/** A field or header some servers take the request's real method from (Rails, Laravel, Express's method-override). */
+export const METHOD_OVERRIDE = /^(_method|x-http-method(-override)?|x-method-override)$/i;
 // A param that is the whole body (raw, base64, the JSON root or a batch's item) is the request the caller
 // writes; one at `query` of a GraphQL request is its document.
 const WHOLE_BODY = /^(body|b64|json:(\/\d+)?)$/;
@@ -58,6 +78,9 @@ export function badAddress(url: string): string | undefined {
 function addresses(op: Operation): [string, string][] {
   const out: [string, string][] = [];
   if (op.request) out.push(["request", op.request.url]);
+  op.slots.forEach((s) => {
+    if (s.from) out.push([`lookup for ${s.at.join(" > ")}`, s.from.request.url]);
+  });
   if (op.trigger) {
     out.push(["trigger", op.trigger.url]);
     if (op.trigger.softFrom) out.push(["softFrom", op.trigger.softFrom]);
@@ -74,7 +97,13 @@ function regexes(op: Operation): [string, string][] {
       p.includes("~") ? [["pick", p.slice(p.indexOf("~") + 1)]] : [],
     ),
     ...(op.response.embedded ? ([["embedded", op.response.embedded.regex]] as [string, string][]) : []),
+    ...(op.paging?.next?.includes("~")
+      ? ([["paging next", op.paging.next.slice(op.paging.next.indexOf("~") + 1)]] as [string, string][])
+      : []),
     ...op.params.flatMap((p): [string, string][] => (p.pattern ? [[`param ${p.name} pattern`, p.pattern]] : [])),
+    ...(op.links ?? []).flatMap((l): [string, string][] =>
+      l.transform?.includes("~") ? [["link transform", l.transform.slice(l.transform.indexOf("~") + 1)]] : [],
+    ),
   ];
 }
 
@@ -102,7 +131,7 @@ function isGraphql(op: Pick<Operation, "request" | "params">): boolean {
 }
 
 /** The GraphQL documents a request carries. */
-function graphqlDocuments(req: Request): string[] {
+export function graphqlDocuments(req: Request): string[] {
   const docs: unknown[] = [];
   const body = req.body ?? "";
   if (/graphql/i.test(req.headers["content-type"] ?? "")) docs.push(body);
@@ -177,10 +206,21 @@ const hostOf = (url: string) => {
 /**
  * Where the args go: the last step of each slot an arg reaches. An arg that is, or is spliced into,
  * the body or the document could make it any request. An arg reaches a param's own slot, and any slot
- * whose template has a hole that is no ref: a ref slot's template is filled from the args too.
+ * whose template has a hole that is no ref: a ref slot's template is filled from the args too. A derived
+ * slot counts as one: its value is whatever the lookup's answer holds, which the site's users may write.
  */
 const argSlots = (op: Pick<Operation, "slots">) =>
-  op.slots.filter((sl) => sl.param !== undefined || argHoles(sl.template ?? "").length > 0).map((sl) => sl.at.at(-1)!);
+  op.slots
+    .filter((sl) => sl.param !== undefined || sl.from !== undefined || argHoles(sl.template ?? "").length > 0)
+    .map((sl) => sl.at.at(-1)!);
+
+/** A slot step at a method-override field: `form:_method`, `query[1]:_method`, `json:/_method`, `header:x-http-method-override`. */
+const overrides = (st: string) =>
+  METHOD_OVERRIDE.test(st.startsWith("json:") ? st.slice(st.lastIndexOf("/") + 1) : st.slice(st.indexOf(":") + 1));
+
+/** The method a read's literal override field names, when it is one that changes something (`_method=DELETE`). */
+const overridden = (req: Request) =>
+  walk(req).find((l) => METHOD_OVERRIDE.test(leafName(l.at)) && !/^(get|head|)$/i.test(l.value.trim()))?.value;
 
 /** A GraphQL request with an operation that carries no document: a JSON item, form or raw body without one. */
 function documentless(req: Request): boolean {
@@ -224,6 +264,9 @@ export function notARead(op: Pick<Operation, "request" | "slots" | "params">): s
   const param = argSlots(op);
   if (param.some((st) => WHOLE_BODY.test(st))) return "a param is its whole body";
   if (graphql && param.some((st) => DOCUMENT_AT.test(st))) return "a param fills its GraphQL document";
+  if (param.some(overrides)) return "a param fills its method override";
+  const override = overridden(op.request);
+  if (override) return `it overrides its method to ${override}`;
   return undefined;
 }
 
@@ -245,9 +288,17 @@ export function pagingProblems(op: Operation): string[] {
   if (p.next !== undefined) {
     if (op.response.format === "html" || op.response.format === "text")
       out.push(`paging next reads JSON (the answer, or JSON the page embeds), not ${op.response.format.toUpperCase()}`);
-    if (p.next.length > LIMITS.regex) out.push(`paging next is ${p.next.length} characters; at most ${LIMITS.regex}`);
-    else if (p.next.includes("[*]")) out.push(`paging next ${JSON.stringify(p.next)} names many values, not one value`);
-    else if (!ONE_VALUE_PATH.test(p.next)) out.push(`paging next ${JSON.stringify(p.next)} is not a path`);
+    // `path~regex`: the path is checked here, the regex with every other regex of the op (`regexes`)
+    const path = p.next.split("~")[0]!;
+    if (path.length > LIMITS.regex) out.push(`paging next is ${path.length} characters; at most ${LIMITS.regex}`);
+    else if (path.includes("[*]")) out.push(`paging next ${JSON.stringify(path)} names many values, not one value`);
+    else if (!ONE_VALUE_PATH.test(path)) out.push(`paging next ${JSON.stringify(path)} is not a path`);
+    if (path !== p.next)
+      try {
+        new RegExp(p.next.slice(path.length + 1));
+      } catch {
+        out.push(`paging next's regex after ~ is not a valid regex`);
+      }
   }
   return out;
 }
@@ -364,6 +415,12 @@ export function vetShared(site: Site, notes?: string): Vetted {
         ),
       );
     for (const problem of [...pagingProblems(op), ...readbackShape(op)]) errors.push(at(problem));
+    for (const problem of linkProblems(site, op)) errors.push(at(problem));
+    if ((op.links?.length ?? 0) > LIMITS.operations) errors.push(at("too many operation links"));
+    for (const link of op.links ?? []) {
+      long(at("link source"), link.from);
+      long(at("link transform"), link.transform);
+    }
     // the read a shared write's readback carries is sent with the caller's session like any read
     const rb = op.readback;
     if (rb && "read" in rb && !op.readOnly)
@@ -396,6 +453,11 @@ export function vetShared(site: Site, notes?: string): Vetted {
     if (op.readOnly && param.some((st) => WHOLE_BODY.test(st))) errors.push(at("a read whose whole body a param is"));
     else if (op.readOnly && param.some((st) => DOCUMENT_AT.test(st)) && isGraphql(op))
       errors.push(at("a read whose GraphQL document a param fills"));
+    if (op.request) {
+      if (op.readOnly && param.some(overrides)) errors.push(at("a read whose method override a param fills"));
+      const override = op.readOnly ? overridden(op.request) : undefined;
+      if (override) errors.push(at(`a read that overrides its method to ${override}`));
+    }
     if (!op.readOnly)
       warnings.push(
         at(`a write (${op.request ? op.request.method : "a local command"}): it runs only with --allow-writes`),
@@ -433,6 +495,28 @@ export function vetShared(site: Site, notes?: string): Vetted {
     if (op.request)
       for (const leaf of literalCredentials(op.request, pub))
         errors.push(at(`request ${leaf.at.join(" > ")} holds a literal credential`));
+    // a lookup is sent first with the caller's session: a read on the op's own host, credentials by ref only
+    for (const s of op.slots) {
+      if (!s.from || !op.request) continue;
+      const where = `the lookup for ${s.at.join(" > ")}`;
+      // as learning places one (learn.ts DERIVABLE): never a header, where credentials and method overrides go
+      if (!/^((path|query|form)(\[\d+\])?:|body$)/.test(s.at[0] ?? ""))
+        errors.push(at(`${where} fills ${s.at[0]}: a looked-up value goes only in the path, query or body`));
+      if (s.from.request.method.toUpperCase() !== "GET")
+        errors.push(at(`${where} is a ${s.from.request.method}, not a GET`));
+      if (hostOf(s.from.request.url) !== hostOf(op.request.url))
+        errors.push(at(`${where} is not on the op's own host`));
+      if (!ONE_VALUE_PATH.test(s.path ?? ""))
+        errors.push(at(`${where} reads ${JSON.stringify(s.path)}, not one value`));
+      // a lookup's answer to the caller's cookies can be their CSRF token: never derived into such a field (learning skips them too)
+      const field = lastToken(s.at);
+      if (SESSION_FIELD.test(field) || credentialName(field))
+        errors.push(at(`${where} fills ${field}, a field named like a session value or credential`));
+      const override = overridden(s.from.request);
+      if (override) errors.push(at(`${where} overrides its method to ${override}`));
+      for (const leaf of literalCredentials(s.from.request, pub))
+        errors.push(at(`${where} ${leaf.at.join(" > ")} holds a literal credential`));
+    }
     for (const fill of signInFills(op.trigger?.steps)) errors.push(at(`trigger ${fill}`));
     if (op.request)
       for (const name of pub)

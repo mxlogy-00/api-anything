@@ -412,99 +412,128 @@ test("linkedin search keywords are percent-encoded once inside the Rest.li query
 
 test("reddit search encodes the query in q= and hot puts the subreddit in the path segment", () => {
   const s = new URL(buildRequest(op("reddit", "search"), { query: "what is rust" }, noSession).url);
-  assert.equal(s.pathname, "/search.json");
+  assert.equal(s.pathname, "/search/");
   assert.equal(s.searchParams.get("q"), "what is rust");
   const u = new URL(buildRequest(op("reddit", "hot"), { sub: "programming" }, noSession).url);
-  assert.equal(u.pathname, "/r/programming/hot.json");
+  assert.equal(u.pathname, "/r/programming/hot/");
 });
 
-test("reddit recipes read the .json listing the site answers", () => {
+test("reddit recipes read the recorded page, item by item", () => {
   const got = ok(op("reddit", "search"), fixture("reddit", "search"));
   assert.deepEqual(
     got.map((p) => p.subreddit),
-    ["r/linux", "r/linux"],
+    ["r/SQL", "r/Database"],
   );
-  assert.deepEqual(got[0], {
-    title: "Linux 6.15 is stable",
-    url: "https://lwn.net/Articles/100001/",
-    subreddit: "r/linux",
-    author: "kernelwatcher",
-    score: 1234,
-    comments: 56,
-    permalink: "/r/linux/comments/9k2q1f/linux_615_is_stable/",
-    selftext: "",
-    created_utc: 1761890000,
-  });
-  assert.equal(
-    typeof got[1]!.selftext === "string" && (got[1]!.selftext as string).length > 0,
-    true,
-    "the self post carries its text",
-  );
-  const hot = ok(op("reddit", "hot"), fixture("reddit", "hot"));
   assert.deepEqual(
-    hot.map((p) => [p.score, p.comments]),
-    [
-      [2400, 311],
-      [640, 95],
-    ],
+    got.map((p) => p.title),
+    ["How far did you go with SQLITE", "SQL is Dead, Long Live SQL"],
   );
-  assert.equal("subreddit" in hot[0]!, false, "the hot feed names no subreddit: it is in the path");
+  assert.equal(String(got[0]!.votes), "12");
+  assert.equal(String(got[1]!.comments), "352");
+  assert.equal(got[0]!.url, "/r/SQL/comments/1t787ah/how_far_did_you_go_with_sqlite/");
+  const hot = ok(op("reddit", "hot"), fixture("reddit", "hot"));
+  assert.equal(hot.length, 2);
+  assert.equal(hot[0]!.title, "Beating the compiler at signed 32-bit division");
+  assert.equal(hot[0]!.subreddit, "r/programming");
+  assert.equal(hot[0]!.author, "alexeyr");
+  assert.equal(String(hot[0]!.score), "93");
+  assert.equal(hot[0]!.url, "https://lemire.me/blog/2026/10/31/beating-the-compiler-at-signed-32-bit-division/");
+  assert.equal(String(hot[1]!.comments), "23");
 });
 
 // ---------------------------------------------------------------- github
 
-test("github ops put owner and repo in the api path; state defaults to open", () => {
-  for (const [name, path] of [
-    ["repo", "/repos/torvalds/linux"],
-    ["readme", "/repos/torvalds/linux/readme"],
-  ] as const) {
-    const u = new URL(buildRequest(op("github", name), { owner: "torvalds", repo: "linux" }, noSession).url);
-    assert.equal(u.origin, "https://api.github.com");
-    assert.equal(u.pathname, path);
-  }
-  const issues = new URL(buildRequest(op("github", "issues"), { owner: "o", repo: "r" }, noSession).url);
-  assert.equal(issues.pathname, "/repos/o/r/issues");
-  assert.equal(issues.searchParams.get("state"), "open");
-  const pulls = new URL(buildRequest(op("github", "pulls"), { owner: "o", repo: "r", state: "all" }, noSession).url);
-  assert.equal(pulls.pathname, "/repos/o/r/pulls");
-  assert.equal(pulls.searchParams.get("state"), "all");
+test("github ops put owner and repo in the page path; issues default to open", () => {
+  const u = new URL(buildRequest(op("github", "getRepo"), { owner: "torvalds", repo: "linux" }, noSession).url);
+  assert.equal(u.origin, "https://github.com");
+  assert.equal(u.pathname, "/torvalds/linux");
+  const search = new URL(buildRequest(op("github", "searchRepos"), { q: "vector database" }, noSession).url);
+  assert.equal(search.pathname, "/search");
+  assert.equal(search.searchParams.get("q"), "vector database");
+  assert.equal(search.searchParams.get("type"), "repositories");
+  const issues = new URL(buildRequest(op("github", "listIssues"), { owner: "o", repo: "r" }, noSession).url);
+  assert.equal(issues.pathname, "/o/r/issues");
+  assert.equal(issues.searchParams.get("q"), "is:issue state:open");
 });
 
-test("github recipes read the api.github.com answers", () => {
-  const repo = judge(op("github", "repo"), {
+test("github recipes read the embedded data the page ships", () => {
+  // github.com answers its pages with the data in a react-app element: the spec's embedded regex
+  const page = (data: unknown) =>
+    `<!DOCTYPE html><html><head></head><body>page<script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(
+      data,
+    )}</script></body></html>`;
+
+  const repo = judge(op("github", "getRepo"), {
     status: 200,
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: fixture("github", "repo"),
+    headers: { "content-type": "text/html; charset=utf-8" },
+    body: page({
+      payload: {
+        sidebarAbout: {
+          ownerLogin: "torvalds",
+          repoName: "linux",
+          description: "Linux kernel source tree",
+          website: "https://git.kernel.org/",
+          topics: [{ name: "kernel" }],
+          stargazerCount: 180000,
+          watcherCount: 5000,
+          forksCount: 120000,
+          repo: { license: { name: "GPL-2.0" }, isArchived: false, isFork: false },
+          sections: { releases: { releaseCount: 1400 } },
+        },
+        codeViewRepoRoute: { refInfo: { name: "master" } },
+      },
+    }),
   });
   assert.equal(repo.class, "ok", repo.reason);
-  const repoData = repo.data as Record<string, unknown>;
-  assert.equal(repoData.full_name, "torvalds/linux");
-  assert.equal(repoData.license_name, "MIT License");
-  const readme = judge(op("github", "readme"), {
-    status: 200,
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: fixture("github", "readme"),
+  assert.deepEqual(repo.data, {
+    owner: "torvalds",
+    name: "linux",
+    description: "Linux kernel source tree",
+    website: "https://git.kernel.org/",
+    topics: ["kernel"],
+    stars: 180000,
+    watchers: 5000,
+    forks: 120000,
+    license: "GPL-2.0",
+    archived: false,
+    fork: false,
+    releases: 1400,
+    defaultBranch: "master",
   });
-  assert.equal(readme.class, "ok", readme.reason);
-  assert.equal(
-    Buffer.from((readme.data as Record<string, unknown>).content as string, "base64")
-      .toString("utf8")
-      .trim(),
-    "# Linux kernel source tree",
-  );
-  const issues = ok(op("github", "issues"), fixture("github", "issues"));
-  assert.deepEqual(
-    issues.map((i) => [i.number, i.state, i.author]),
-    [
-      [1001, "open", "kernelpatcher"],
-      [1002, "open", "storagecrew"],
-    ],
-  );
-  const pulls = ok(op("github", "pulls"), fixture("github", "pulls"));
-  assert.deepEqual(
-    pulls.map((p) => p.merged_at),
-    [null, null],
-  );
+
+  const found = judge(op("github", "searchRepos"), {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+    body: page({
+      payload: {
+        blackbirdSearchRoute: {
+          results: [
+            {
+              repo: { repository: { owner_login: "qdrant", name: "qdrant", updated_at: "2026-01-05T00:00:00Z" } },
+              hl_trunc_description: "Fast high-dimensional vector database",
+              followers: 30000,
+              language: "Rust",
+              topics: ["vector-database"],
+              archived: false,
+            },
+          ],
+        },
+      },
+    }),
+  });
+  assert.equal(found.class, "ok", found.reason);
+  assert.deepEqual(found.data, [
+    {
+      owner: "qdrant",
+      name: "qdrant",
+      description: "Fast high-dimensional vector database",
+      stars: 30000,
+      language: "Rust",
+      topics: ["vector-database"],
+      updatedAt: "2026-01-05T00:00:00Z",
+      archived: false,
+    },
+  ]);
 });
 
 // ---------------------------------------------------------------- notes
